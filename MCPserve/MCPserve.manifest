@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "author": "",
+    "description": {
+        "": "MCP Bridge for Fusion 360 — enables AI assistants to interact with Fusion 360 via the Model Context Protocol."
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac"
+}
