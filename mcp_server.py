@@ -22,6 +22,7 @@ import argparse
 import asyncio
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
@@ -31,6 +32,7 @@ COMM_DIR.mkdir(parents=True, exist_ok=True)
 
 COMMAND_TIMEOUT = 15.0
 POLL_INTERVAL = 0.1
+STATUS_STALE_SECONDS = 5.0
 
 _parser = argparse.ArgumentParser(description="Fusion 360 MCP Server")
 _parser.add_argument("--stdio", action="store_true", help="Use stdio transport instead of SSE")
@@ -44,11 +46,15 @@ async def send_command(command: str, params: dict | None = None, timeout: float 
     if params is None:
         params = {}
 
-    command_id = str(int(time.time() * 1000))
+    command_id = f"{time.time_ns()}_{uuid4().hex[:8]}"
     command_file = COMM_DIR / f"command_{command_id}.json"
     response_file = COMM_DIR / f"response_{command_id}.json"
 
-    command_file.write_text(json.dumps({"command": command, "params": params}, indent=2))
+    _atomic_write_json(command_file, {
+        "command": command,
+        "params": params,
+        "created_at_unix": time.time(),
+    })
 
     start = time.monotonic()
     while time.monotonic() - start < timeout:
@@ -56,13 +62,21 @@ async def send_command(command: str, params: dict | None = None, timeout: float 
             try:
                 response = json.loads(response_file.read_text())
                 if "error" in response:
+                    _safe_unlink(response_file)
+                    _safe_unlink(command_file)
                     raise RuntimeError(response["error"])
-                return response.get("result")
+                result = response.get("result")
+                _safe_unlink(response_file)
+                _safe_unlink(command_file)
+                return result
             except json.JSONDecodeError:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
         await asyncio.sleep(POLL_INTERVAL)
 
+    # Remove timed-out command file so old actions don't run on restart.
+    _safe_unlink(command_file)
+    _safe_unlink(response_file)
     raise TimeoutError(
         f"Fusion 360 did not respond to '{command}' within {timeout}s. "
         "Make sure the Fusion 360 add-in is running."
@@ -75,10 +89,33 @@ def check_fusion_addin_running() -> bool:
     if status_file.exists():
         try:
             status = json.loads(status_file.read_text())
-            return status.get("status") == "running"
+            if status.get("status") != "running":
+                return False
+            heartbeat = status.get("heartbeat_unix")
+            if heartbeat is not None:
+                return (time.time() - float(heartbeat)) <= STATUS_STALE_SECONDS
+            # Fallback for older add-in versions without heartbeat.
+            return (time.time() - status_file.stat().st_mtime) <= STATUS_STALE_SECONDS
         except Exception:
             pass
     return (COMM_DIR / "client_ready.txt").exists()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON atomically to avoid partially-written command files."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    tmp_path.replace(path)
+
+
+def _safe_unlink(path: Path) -> None:
+    """Best-effort unlink that ignores missing files."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 # --- MCP Server ---

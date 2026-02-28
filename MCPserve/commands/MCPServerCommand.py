@@ -22,6 +22,7 @@ ui = app.userInterface
 
 server_thread = None
 server_running = False
+server_started_at_unix = None
 handlers = []
 message_command_handlers = []
 
@@ -29,10 +30,18 @@ message_command_handlers = []
 ADDON_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = ADDON_DIR.parent
 COMM_DIR = WORKSPACE_DIR / "mcp_comm"
+HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
 def _ensure_comm_dir():
     COMM_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _write_json_atomic(file_path, data):
+    """Write JSON atomically to avoid partially-written response/status files."""
+    tmp_path = Path(str(file_path) + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2))
+    os.replace(str(tmp_path), str(file_path))
 
 
 def _log(filename, message):
@@ -48,9 +57,14 @@ def _log(filename, message):
 def _write_status(status="running"):
     """Write the server_status.json file so the MCP server can detect us."""
     _ensure_comm_dir()
+    now_unix = time.time()
+    started_unix = server_started_at_unix if server_started_at_unix else now_unix
     status_data = {
         "status": status,
-        "started_at": time.ctime(),
+        "started_at_unix": started_unix,
+        "started_at": time.ctime(started_unix),
+        "heartbeat_unix": now_unix,
+        "updated_at": time.ctime(now_unix),
         "fusion_version": app.version,
         "available_resources": [
             "fusion://active-document-info",
@@ -70,7 +84,7 @@ def _write_status(status="running"):
             "parameter_setup_prompt",
         ],
     }
-    (COMM_DIR / "server_status.json").write_text(json.dumps(status_data, indent=2))
+    _write_json_atomic(COMM_DIR / "server_status.json", status_data)
 
 
 # ── Command Handlers ─────────────────────────────────────────────────
@@ -88,6 +102,8 @@ def handle_command(command, params):
             {"name": "message_box", "description": "Display a message box in Fusion 360"},
             {"name": "create_new_sketch", "description": "Create a new sketch on the specified plane"},
             {"name": "create_parameter", "description": "Create a new parameter in the active design"},
+            {"name": "create_box", "description": "Create a 3D box from dimensions"},
+            {"name": "execute_script", "description": "Execute Python script using Fusion 360 API"},
         ]
     elif command == "list_prompts":
         return [
@@ -428,10 +444,15 @@ def _file_monitor():
     """Poll mcp_comm/ for command files and process them."""
     _log("monitor.txt", "File monitor started")
     comm_dir = str(COMM_DIR)
+    last_heartbeat = 0.0
 
     while server_running:
         try:
             _ensure_comm_dir()
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                _write_status("running")
+                last_heartbeat = now
 
             # Process message_box.txt shortcut
             msg_file = os.path.join(comm_dir, "message_box.txt")
@@ -447,7 +468,7 @@ def _file_monitor():
                     _log("monitor.txt", f"Error processing message_box.txt: {e}")
 
             # Process command_*.json files
-            for fname in os.listdir(comm_dir):
+            for fname in sorted(os.listdir(comm_dir)):
                 if not (fname.startswith("command_") and fname.endswith(".json")):
                     continue
 
@@ -469,19 +490,19 @@ def _file_monitor():
 
                     result = handle_command(command, params)
 
-                    with open(response_file, "w") as f:
-                        json.dump({"result": result}, f, indent=2)
+                    _write_json_atomic(response_file, {"result": result})
 
                     os.rename(command_file, processed_file)
 
                 except json.JSONDecodeError as e:
-                    with open(response_file, "w") as f:
-                        json.dump({"error": f"Invalid JSON: {e}"}, f)
+                    _write_json_atomic(response_file, {"error": f"Invalid JSON: {e}"})
+                    bad_file = os.path.join(comm_dir, f"bad_command_{cmd_id}.json")
+                    if os.path.exists(command_file):
+                        os.rename(command_file, bad_file)
                 except Exception as e:
                     _log("monitor.txt", f"Error processing {fname}: {e}\n{traceback.format_exc()}")
                     try:
-                        with open(response_file, "w") as f:
-                            json.dump({"error": str(e)}, f)
+                        _write_json_atomic(response_file, {"error": str(e)})
                     except Exception:
                         pass
 
@@ -496,13 +517,14 @@ def _file_monitor():
 # ── Server Lifecycle ──────────────────────────────────────────────────
 
 def start_server():
-    global server_thread, server_running
+    global server_thread, server_running, server_started_at_unix
 
     if server_running and server_thread and server_thread.is_alive():
         return True
 
     _ensure_comm_dir()
     _log("server.txt", "Starting file monitor bridge")
+    server_started_at_unix = time.time()
     _write_status("running")
 
     server_running = True
@@ -519,11 +541,12 @@ def start_server():
 
 
 def stop_server():
-    global server_running
+    global server_running, server_started_at_unix
     if not server_running:
         return
     server_running = False
     _write_status("stopped")
+    server_started_at_unix = None
     if server_thread and server_thread.is_alive():
         server_thread.join(timeout=2.0)
     _log("server.txt", "Server stopped")
